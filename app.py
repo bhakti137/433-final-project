@@ -9,15 +9,14 @@ import streamlit as st
 
 from ev_dashboard.pipeline import (
     BoundsConfig,
-    OptimizationWeights,
     build_recommendation_summary,
     build_station_capacity_map,
     build_time_series_summary,
     compare_strategies,
     load_data,
-    optimize_all_timestamps,
     predict_outcomes,
     prepare_features,
+    run_weight_sensitivity_analysis,
     train_predictive_models,
 )
 
@@ -88,13 +87,14 @@ def get_trained_assets() -> dict:
     trained = train_predictive_models(df, metadata)
     enriched = predict_outcomes(df, metadata, trained["models"])
     capacity_map = build_station_capacity_map(enriched)
-    optimized = optimize_all_timestamps(
+    sensitivity = run_weight_sensitivity_analysis(
         enriched,
-        models=trained["models"],
-        capacity_map=capacity_map,
-        weights=OptimizationWeights(),
-        bounds_config=BoundsConfig(),
+        metadata,
+        trained["models"],
+        capacity_map,
+        BoundsConfig(),
     )
+    optimized = sensitivity["scenario_results"]["default"]
     comparison = compare_strategies(
         optimized,
         metadata,
@@ -111,6 +111,10 @@ def get_trained_assets() -> dict:
         "capacity_map": capacity_map,
         "comparison": comparison,
         "time_series": time_series,
+        "sensitivity_summary": sensitivity["sensitivity_summary"],
+        "overall_stability_label": sensitivity["overall_stability_label"],
+        "overall_interpretation": sensitivity["overall_interpretation"],
+        "scenario_results": sensitivity["scenario_results"],
     }
 
 
@@ -319,7 +323,14 @@ def render_recommendations(filtered: pd.DataFrame, capacity_map: dict) -> None:
 
 
 def render_analytics(assets: dict) -> None:
-    tabs = st.tabs(["Strategy Comparison", "Demand & Capacity Insights", "Model Insights"])
+    tabs = st.tabs(
+        [
+            "Strategy Comparison",
+            "Demand & Capacity Insights",
+            "Model Insights",
+            "Sensitivity Analysis",
+        ]
+    )
 
     with tabs[0]:
         comparison = assets["comparison"]
@@ -392,6 +403,63 @@ def render_analytics(assets: dict) -> None:
             }
         )
         st.dataframe(feature_story, use_container_width=True, hide_index=True)
+
+    with tabs[3]:
+        sensitivity = assets["sensitivity_summary"].copy()
+        numeric_cols = [
+            "power_loss_weight",
+            "voltage_fluctuation_weight",
+            "grid_stability_weight",
+            "action_flip_rate",
+            "direction_flip_rate",
+            "mean_absolute_power_shift",
+            "max_absolute_power_shift",
+            "station_rank_change",
+            "avg_power_loss_delta",
+            "avg_voltage_fluctuation_delta",
+            "avg_grid_stability_score_delta",
+            "feasibility_rate",
+        ]
+        for column in numeric_cols:
+            sensitivity[column] = sensitivity[column].round(3)
+
+        st.markdown(
+            f"""
+            **Overall stability:** `{assets["overall_stability_label"]}`  
+            {assets["overall_interpretation"]}
+            """
+        )
+        st.caption(
+            "Scenarios are marked Stable when action flip rate is below 10%, mean absolute power shift "
+            "is below 0.75 kW, and feasibility remains perfect."
+        )
+        st.dataframe(sensitivity, use_container_width=True, hide_index=True)
+
+        bar_left, bar_right = st.columns(2)
+        flip_fig = px.bar(
+            sensitivity,
+            x="scenario_name",
+            y="action_flip_rate",
+            color="stability_label",
+            title="Action Flip Rate by Weight Scenario",
+            color_discrete_map={"Stable": ACCENT, "Sensitive": ALERT},
+        )
+        flip_fig.update_layout(xaxis_title="Scenario", yaxis_title="Action Flip Rate")
+        bar_left.plotly_chart(flip_fig, use_container_width=True)
+
+        shift_fig = px.bar(
+            sensitivity,
+            x="scenario_name",
+            y="mean_absolute_power_shift",
+            color="stability_label",
+            title="Mean Absolute Power Shift vs Default",
+            color_discrete_map={"Stable": ACCENT, "Sensitive": ALERT},
+        )
+        shift_fig.update_layout(
+            xaxis_title="Scenario",
+            yaxis_title="Mean Absolute Power Shift (kW)",
+        )
+        bar_right.plotly_chart(shift_fig, use_container_width=True)
 
 
 def main() -> None:

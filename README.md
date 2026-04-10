@@ -286,37 +286,247 @@ This project intentionally favors explainability over model complexity. Linear r
 
 The optimizer works at the timestamp level. For each timestamp, it determines recommended charging power allocations for all active charging sessions.
 
-### Decision Variable
+### Mathematical Formulation
 
-- Charging power allocated to each active EV/session at a given timestamp
+#### Sets and Indices
 
-### Objective
+- \( i \in \mathcal{I}_t \): charging sessions active in time period \( t \)
+- \( s \in \mathcal{S} \): charging stations
+- \( \mathcal{I}_s \subseteq \mathcal{I}_t \): set of charging sessions assigned to station \( s \)
 
-Minimize a weighted combination of:
+#### Decision Variable
 
-- Predicted power loss
-- Predicted voltage fluctuation
+For each charging session \( i \) at time period \( t \), the decision variable is:
 
-While also maximizing:
+\[
+x_i = \text{charging power allocated to EV session } i
+\]
 
-- Predicted grid stability score
+where:
 
-The default weights used in the app are:
+- \( x_i \geq 0 \)
+- \( x_i \) is measured in kilowatts
 
-- Power loss: `0.45`
-- Voltage fluctuation: `0.35`
-- Grid stability: `0.20`
+In the implementation, this optimized value is stored as `explicit_optimized_power`.
 
-### Constraints
+#### Parameters
 
-- Total allocated power should satisfy total predicted demand for the selected timestamp
-- Each session must receive at least `80%` of its predicted demand
-- Each session can receive at most `120%` of its predicted demand
-- Station-level load must stay below an estimated station capacity
+- \( d_i \): predicted power demand for session \( i \)
+- \( C_s \): estimated capacity of station \( s \)
+- \( \underline{\alpha} = 0.8 \): minimum demand satisfaction fraction
+- \( \overline{\alpha} = 1.2 \): maximum demand allocation fraction
+- \( U_i \): session-specific upper bound proxy
 
-### Station Capacity Assumption
+The optimization also uses learned regression coefficients from the predictive models:
 
-The dataset does not include explicit hardware power limits. To keep the problem feasible and realistic, station capacity is estimated from the historical 95th percentile of observed station-level charging loads.
+- \( a_{\text{loss}} \): coefficient of charging power in the power-loss model
+- \( a_{\text{volt}} \): coefficient of charging power in the voltage-fluctuation model
+- \( a_{\text{grid}} \): coefficient of charging power in the grid-stability model
+
+The default objective weights are:
+
+- \( w_{\text{loss}} = 0.45 \)
+- \( w_{\text{volt}} = 0.35 \)
+- \( w_{\text{grid}} = 0.20 \)
+
+#### Objective Function
+
+The model minimizes a weighted combination of predicted power loss, predicted voltage fluctuation, and negative grid stability:
+
+\[
+\min \sum_{i \in \mathcal{I}_t}
+\left(
+w_{\text{loss}} a_{\text{loss}}
++ w_{\text{volt}} a_{\text{volt}}
+- w_{\text{grid}} a_{\text{grid}}
+\right) x_i
+\]
+
+This objective reflects three goals:
+
+1. Minimize predicted power loss
+2. Minimize predicted voltage fluctuation
+3. Maximize predicted grid stability
+
+Since the optimizer is solved as a linear program, the learned effect of charging power on each outcome is represented using the corresponding linear regression coefficient.
+
+#### Constraints
+
+##### 1. Demand Satisfaction Constraint
+
+The total allocated charging power in a time period must meet the total predicted charging demand:
+
+\[
+\sum_{i \in \mathcal{I}_t} x_i = \sum_{i \in \mathcal{I}_t} d_i
+\]
+
+In practice, the implementation clips the total demand target when necessary so that the problem remains feasible under all lower and upper bounds.
+
+##### 2. Minimum Allocation per Session
+
+Each session must receive at least 80% of its predicted power demand:
+
+\[
+x_i \geq \underline{\alpha} d_i
+\qquad \forall i \in \mathcal{I}_t
+\]
+
+With the current parameter setting:
+
+\[
+x_i \geq 0.8 d_i
+\qquad \forall i \in \mathcal{I}_t
+\]
+
+##### 3. Maximum Allocation per Session
+
+Each session can receive at most 120% of its predicted demand, subject to a session-level and station-level cap:
+
+\[
+x_i \leq \min \left( \overline{\alpha} d_i,\; U_i,\; C_{s(i)} \right)
+\qquad \forall i \in \mathcal{I}_t
+\]
+
+With the current parameter setting:
+
+\[
+x_i \leq \min \left( 1.2 d_i,\; U_i,\; C_{s(i)} \right)
+\qquad \forall i \in \mathcal{I}_t
+\]
+
+where:
+
+- \( U_i \) is the session upper-bound proxy
+- \( C_{s(i)} \) is the capacity of the station assigned to session \( i \)
+
+##### 4. Station Capacity Constraint
+
+For each station, the total allocated charging power must not exceed the station capacity:
+
+\[
+\sum_{i \in \mathcal{I}_s} x_i \leq C_s
+\qquad \forall s \in \mathcal{S}
+\]
+
+The station capacity \( C_s \) is estimated from the historical 95th percentile of observed charging power at that station.
+
+##### 5. Non-Negativity Constraint
+
+Charging allocations must remain non-negative:
+
+\[
+x_i \geq 0
+\qquad \forall i \in \mathcal{I}_t
+\]
+
+#### Complete Model
+
+The complete optimization model can be written as:
+
+\[
+\min \sum_{i \in \mathcal{I}_t}
+\left(
+w_{\text{loss}} a_{\text{loss}}
++ w_{\text{volt}} a_{\text{volt}}
+- w_{\text{grid}} a_{\text{grid}}
+\right) x_i
+\]
+
+subject to:
+
+\[
+\sum_{i \in \mathcal{I}_t} x_i = \sum_{i \in \mathcal{I}_t} d_i
+\]
+
+\[
+x_i \geq 0.8 d_i
+\qquad \forall i \in \mathcal{I}_t
+\]
+
+\[
+x_i \leq \min \left( 1.2 d_i,\; U_i,\; C_{s(i)} \right)
+\qquad \forall i \in \mathcal{I}_t
+\]
+
+\[
+\sum_{i \in \mathcal{I}_s} x_i \leq C_s
+\qquad \forall s \in \mathcal{S}
+\]
+
+\[
+x_i \geq 0
+\qquad \forall i \in \mathcal{I}_t
+\]
+
+#### Interpretation
+
+The optimization allocates charging power across active EV sessions so that:
+
+- predicted demand is satisfied
+- over-allocation is controlled
+- station capacity limits are respected
+- grid stress indicators are improved
+
+The objective function combines engineering and operational goals into one weighted decision rule. The default weights emphasize reducing power loss the most, followed by reducing voltage fluctuation, while still rewarding improved grid stability.
+
+#### Practical Note on the Dataset
+
+Although the model is written in general multi-session form, the current dataset contains approximately one row per timestamp on average. As a result, the mathematical formulation allows multiple simultaneous charging decisions, but the available data often behaves more like a sequence of single-session optimization problems.
+
+This should be acknowledged when interpreting results in a report: the formulation is valid, but the dataset structure limits the practical amount of within-timestamp power redistribution.
+
+### Sensitivity Analysis
+
+Because this is a multi-objective optimizer, the recommended charging allocations depend on the relative weights assigned to:
+
+- `power_loss`
+- `voltage_fluctuation`
+- `grid_stability`
+
+To test robustness, the project runs a sensitivity analysis over multiple weight scenarios:
+
+- `default`: `(0.45, 0.35, 0.20)`
+- `loss_plus_small`: `(0.50, 0.30, 0.20)`
+- `voltage_plus_small`: `(0.40, 0.40, 0.20)`
+- `stability_plus_small`: `(0.40, 0.30, 0.30)`
+- `loss_minus_small`: `(0.40, 0.40, 0.20)`
+- `voltage_minus_small`: `(0.50, 0.25, 0.25)`
+- `stability_minus_small`: `(0.50, 0.35, 0.15)`
+- `balanced_equal`: `(0.34, 0.33, 0.33)`
+- `loss_heavy`: `(0.60, 0.25, 0.15)`
+- `voltage_heavy`: `(0.25, 0.60, 0.15)`
+- `stability_heavy`: `(0.25, 0.25, 0.50)`
+
+Each scenario is compared against the default optimization result using:
+
+- `action_flip_rate`: share of rows where the recommendation category changes
+- `direction_flip_rate`: share of rows where the direction of the recommendation changes
+- `mean_absolute_power_shift`: average change in optimized charging power relative to default
+- `max_absolute_power_shift`: maximum change in optimized charging power relative to default
+- `station_rank_change`: average shift in station ranking by total optimized power
+- predicted outcome deltas for:
+  - average power loss
+  - average voltage fluctuation
+  - average grid stability score
+- `feasibility_rate`: share of results that remain feasible
+
+The project uses a balanced stability rule:
+
+- A scenario is labeled `Stable` when:
+  - `action_flip_rate < 0.10`
+  - `mean_absolute_power_shift < 0.75`
+  - `feasibility_rate = 1.0`
+- Otherwise it is labeled `Sensitive`
+
+The optimizer is labeled:
+
+- `Reasonably stable` if fewer than 3 small-perturbation scenarios are sensitive
+- `Potentially unstable` if 3 or more small-perturbation scenarios are sensitive
+
+How to interpret this:
+
+- `Reasonably stable` means small changes to the objective weights do not materially change recommendations
+- `Potentially unstable` means recommendations shift noticeably even when the weights are only adjusted slightly, so the results should be presented with caution
 
 ## Dashboard Features
 
@@ -431,6 +641,11 @@ The dashboard includes three analytics tabs:
 - `Model Insights`
   - Model error metrics
   - High-level assumptions behind the optimization pipeline
+- `Sensitivity Analysis`
+  - Weight-scenario comparison table
+  - Action-flip bar chart
+  - Mean power-shift bar chart
+  - Overall optimizer stability summary
 
 What this section explains:
 
@@ -448,6 +663,11 @@ What this section explains:
   - How well the predictive models are performing
   - Which assumptions support the optimization routine
   - Why the dashboard can produce recommendations from the available data
+
+- `Sensitivity Analysis`
+  - Whether the optimizer is robust to small changes in the objective weights
+  - Which weight scenarios materially change charging recommendations
+  - Whether the current optimization setup should be presented as stable or potentially unstable
 
 This final section helps the reader move from operational monitoring to deeper analysis. It explains the broader system behavior, supports the validity of the optimization approach, and gives the project a stronger analytical narrative.
 
@@ -663,6 +883,9 @@ The project exposes these reusable functions in `ev_dashboard/pipeline.py`:
 - `build_station_capacity_map(df)`
 - `optimize_timestamp_allocation(group_df, models, capacity_map, weights, bounds_config)`
 - `optimize_all_timestamps(df, models, capacity_map, weights, bounds_config)`
+- `generate_weight_scenarios()`
+- `run_weight_sensitivity_analysis(df, metadata, models, capacity_map, bounds_config)`
+- `compare_weight_scenarios(default_df, scenario_results, metadata, models, capacity_map, bounds_config)`
 - `evaluate_strategy(df, power_column, metadata, models, capacity_map, bounds_config)`
 - `compare_strategies(df, metadata, models, capacity_map, bounds_config)`
 
@@ -680,6 +903,16 @@ The strategy comparison focuses on:
 - Demand satisfaction rate
 - Session-bounds compliance rate
 - Station-capacity compliance rate
+
+For sensitivity analysis, the project also tracks:
+
+- Action flip rate
+- Direction flip rate
+- Mean absolute power shift
+- Max absolute power shift
+- Station rank change
+- Predicted outcome deltas versus the default weight setting
+- Feasibility rate across weight scenarios
 
 These metrics help assess whether a charging strategy is efficient, stable, and operationally feasible. Outcome comparisons are generated from the trained predictive models after substituting each strategy's charging power into the feature set.
 

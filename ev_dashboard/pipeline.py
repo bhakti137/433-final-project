@@ -33,6 +33,7 @@ DISPLAY_LABELS = {
 
 @dataclass(frozen=True)
 class OptimizationWeights:
+    scenario_name: str = "default"
     power_loss: float = 0.45
     voltage_fluctuation: float = 0.35
     grid_stability: float = 0.20
@@ -292,6 +293,34 @@ def optimize_all_timestamps(
     return pd.concat(optimized_groups, ignore_index=True)
 
 
+def generate_weight_scenarios() -> List[OptimizationWeights]:
+    raw_scenarios = [
+        ("default", 0.45, 0.35, 0.20),
+        ("loss_plus_small", 0.50, 0.30, 0.20),
+        ("voltage_plus_small", 0.40, 0.40, 0.20),
+        ("stability_plus_small", 0.40, 0.30, 0.30),
+        ("loss_minus_small", 0.40, 0.40, 0.20),
+        ("voltage_minus_small", 0.50, 0.25, 0.25),
+        ("stability_minus_small", 0.50, 0.35, 0.15),
+        ("balanced_equal", 0.34, 0.33, 0.33),
+        ("loss_heavy", 0.60, 0.25, 0.15),
+        ("voltage_heavy", 0.25, 0.60, 0.15),
+        ("stability_heavy", 0.25, 0.25, 0.50),
+    ]
+    scenarios: List[OptimizationWeights] = []
+    for name, loss, voltage, stability in raw_scenarios:
+        total = loss + voltage + stability
+        scenarios.append(
+            OptimizationWeights(
+                scenario_name=name,
+                power_loss=loss / total,
+                voltage_fluctuation=voltage / total,
+                grid_stability=stability / total,
+            )
+        )
+    return scenarios
+
+
 def _predict_strategy_outcomes(
     df: pd.DataFrame,
     metadata: Dict[str, List[str]],
@@ -300,6 +329,23 @@ def _predict_strategy_outcomes(
 ) -> pd.DataFrame:
     evaluation_frame = df.copy()
     evaluation_frame["charging_power"] = evaluation_frame[power_column]
+    features = evaluation_frame[metadata["base_features"]]
+    evaluation_frame["eval_power_loss"] = models["power_loss"].predict(features)
+    evaluation_frame["eval_voltage_fluctuation"] = models["voltage_fluctuation"].predict(features)
+    evaluation_frame["eval_grid_stability_score"] = np.clip(
+        models["grid_stability_score"].predict(features), 0.0, 1.0
+    )
+    return evaluation_frame
+
+
+def _predict_custom_power_outcomes(
+    df: pd.DataFrame,
+    metadata: Dict[str, List[str]],
+    models: Dict[str, Pipeline],
+    custom_power_column: str,
+) -> pd.DataFrame:
+    evaluation_frame = df.copy()
+    evaluation_frame["charging_power"] = evaluation_frame[custom_power_column]
     features = evaluation_frame[metadata["base_features"]]
     evaluation_frame["eval_power_loss"] = models["power_loss"].predict(features)
     evaluation_frame["eval_voltage_fluctuation"] = models["voltage_fluctuation"].predict(features)
@@ -412,3 +458,155 @@ def build_recommendation_summary(
     if not recommendations:
         recommendations.append("Current allocations are already close to the optimizer recommendations.")
     return recommendations[:8]
+
+
+def _station_rank_shift(default_df: pd.DataFrame, scenario_df: pd.DataFrame) -> float:
+    default_totals = default_df.groupby("station_id")["explicit_optimized_power"].sum()
+    scenario_totals = scenario_df.groupby("station_id")["explicit_optimized_power"].sum()
+    stations = sorted(set(default_totals.index).union(set(scenario_totals.index)), key=str)
+    default_ranks = default_totals.reindex(stations, fill_value=0.0).rank(ascending=False, method="average")
+    scenario_ranks = scenario_totals.reindex(stations, fill_value=0.0).rank(ascending=False, method="average")
+    return float((default_ranks - scenario_ranks).abs().mean())
+
+
+def _classify_sensitivity_row(row: pd.Series) -> str:
+    if (
+        row["action_flip_rate"] < 0.10
+        and row["mean_absolute_power_shift"] < 0.75
+        and row["feasibility_rate"] == 1.0
+    ):
+        return "Stable"
+    return "Sensitive"
+
+
+def compare_weight_scenarios(
+    default_df: pd.DataFrame,
+    scenario_results: Dict[str, pd.DataFrame],
+    metadata: Dict[str, List[str]],
+    models: Dict[str, Pipeline],
+    capacity_map: Dict[str, float],
+    bounds_config: BoundsConfig | None = None,
+) -> pd.DataFrame:
+    bounds_config = bounds_config or BoundsConfig()
+    default_eval = _predict_custom_power_outcomes(
+        default_df, metadata, models, "explicit_optimized_power"
+    )
+    default_metrics = {
+        "avg_power_loss": float(default_eval["eval_power_loss"].mean()),
+        "avg_voltage_fluctuation": float(default_eval["eval_voltage_fluctuation"].mean()),
+        "avg_grid_stability_score": float(default_eval["eval_grid_stability_score"].mean()),
+    }
+    default_station_ranks = _station_rank_shift(default_df, default_df)
+    rows: List[Dict[str, float | str]] = []
+
+    for scenario_name, scenario_df in scenario_results.items():
+        scenario_eval = _predict_custom_power_outcomes(
+            scenario_df, metadata, models, "explicit_optimized_power"
+        )
+        default_actions = default_df["recommended_action"].to_numpy()
+        scenario_actions = scenario_df["recommended_action"].to_numpy()
+        default_direction = np.sign(default_df["power_adjustment"].to_numpy())
+        scenario_direction = np.sign(scenario_df["power_adjustment"].to_numpy())
+        power_shift = (
+            scenario_df["explicit_optimized_power"].to_numpy()
+            - default_df["explicit_optimized_power"].to_numpy()
+        )
+        weights = scenario_df.iloc[0][
+            ["weight_power_loss", "weight_voltage_fluctuation", "weight_grid_stability"]
+        ]
+        rows.append(
+            {
+                "scenario_name": scenario_name,
+                "power_loss_weight": float(weights["weight_power_loss"]),
+                "voltage_fluctuation_weight": float(weights["weight_voltage_fluctuation"]),
+                "grid_stability_weight": float(weights["weight_grid_stability"]),
+                "action_flip_rate": float((scenario_actions != default_actions).mean()),
+                "direction_flip_rate": float((scenario_direction != default_direction).mean()),
+                "mean_absolute_power_shift": float(np.abs(power_shift).mean()),
+                "max_absolute_power_shift": float(np.abs(power_shift).max()),
+                "station_rank_change": float(_station_rank_shift(default_df, scenario_df) - default_station_ranks),
+                "avg_power_loss_delta": float(
+                    scenario_eval["eval_power_loss"].mean() - default_metrics["avg_power_loss"]
+                ),
+                "avg_voltage_fluctuation_delta": float(
+                    scenario_eval["eval_voltage_fluctuation"].mean()
+                    - default_metrics["avg_voltage_fluctuation"]
+                ),
+                "avg_grid_stability_score_delta": float(
+                    scenario_eval["eval_grid_stability_score"].mean()
+                    - default_metrics["avg_grid_stability_score"]
+                ),
+                "feasibility_rate": float(scenario_df["optimization_feasible"].mean()),
+            }
+        )
+
+    summary = pd.DataFrame(rows).sort_values("scenario_name").reset_index(drop=True)
+    summary["stability_label"] = summary.apply(_classify_sensitivity_row, axis=1)
+    return summary
+
+
+def run_weight_sensitivity_analysis(
+    df: pd.DataFrame,
+    metadata: Dict[str, List[str]],
+    models: Dict[str, Pipeline],
+    capacity_map: Dict[str, float],
+    bounds_config: BoundsConfig | None = None,
+) -> Dict[str, object]:
+    bounds_config = bounds_config or BoundsConfig()
+    scenario_results: Dict[str, pd.DataFrame] = {}
+    scenarios = generate_weight_scenarios()
+
+    for weights in scenarios:
+        scenario_df = optimize_all_timestamps(
+            df,
+            models=models,
+            capacity_map=capacity_map,
+            weights=weights,
+            bounds_config=bounds_config,
+        ).copy()
+        scenario_df["scenario_name"] = weights.scenario_name
+        scenario_df["weight_power_loss"] = weights.power_loss
+        scenario_df["weight_voltage_fluctuation"] = weights.voltage_fluctuation
+        scenario_df["weight_grid_stability"] = weights.grid_stability
+        scenario_results[weights.scenario_name] = scenario_df
+
+    default_df = scenario_results["default"]
+    sensitivity_summary = compare_weight_scenarios(
+        default_df=default_df,
+        scenario_results=scenario_results,
+        metadata=metadata,
+        models=models,
+        capacity_map=capacity_map,
+        bounds_config=bounds_config,
+    )
+
+    small_perturbation_names = {
+        "loss_plus_small",
+        "voltage_plus_small",
+        "stability_plus_small",
+        "loss_minus_small",
+        "voltage_minus_small",
+        "stability_minus_small",
+    }
+    sensitive_small_count = int(
+        sensitivity_summary[
+            sensitivity_summary["scenario_name"].isin(small_perturbation_names)
+            & (sensitivity_summary["stability_label"] == "Sensitive")
+        ].shape[0]
+    )
+    overall_label = (
+        "Potentially unstable" if sensitive_small_count >= 3 else "Reasonably stable"
+    )
+    interpretation = (
+        "Recommendations are sensitive to minor weight changes and should be interpreted cautiously."
+        if overall_label == "Potentially unstable"
+        else "Small weight changes do not materially alter recommendations."
+    )
+
+    return {
+        "scenario_results": scenario_results,
+        "sensitivity_summary": sensitivity_summary,
+        "overall_stability_label": overall_label,
+        "overall_interpretation": interpretation,
+        "small_perturbation_sensitive_count": sensitive_small_count,
+    }
